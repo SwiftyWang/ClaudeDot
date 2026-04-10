@@ -24,12 +24,12 @@ enum ClaudeStatus: Equatable {
 
     var label: String {
         switch self {
-        case .disconnected: return "未连接"
-        case .idle: return "等待输入"
-        case .thinking: return "思考中"
-        case .responding: return "生成回复"
-        case .toolActive: return "执行工具"
-        case .awaitingPermission: return "等待授权"
+        case .disconnected: return String(localized: "status.disconnected")
+        case .idle: return String(localized: "status.idle")
+        case .thinking: return String(localized: "status.thinking")
+        case .responding: return String(localized: "status.responding")
+        case .toolActive: return String(localized: "status.toolActive")
+        case .awaitingPermission: return String(localized: "status.awaitingPermission")
         }
     }
 
@@ -506,7 +506,10 @@ class StatusLineSetup {
 
 class SoundManager {
     static let shared = SoundManager()
-    var enabled = true
+    var enabled: Bool {
+        get { UserDefaults.standard.object(forKey: "soundEnabled") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "soundEnabled") }
+    }
     private var previousStatus: ClaudeStatus = .disconnected
 
     func playStatusChange(from oldStatus: ClaudeStatus, to newStatus: ClaudeStatus) {
@@ -722,13 +725,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func activateClaudeCode() {
-        let terminals = [
-            "com.mitchellh.ghostty",
-            "com.googlecode.iterm2",
-            "dev.warp.Warp-Stable",
-            "com.apple.Terminal"
+        let selected = UserDefaults.standard.string(forKey: "selectedTerminal") ?? "auto"
+
+        let terminalMap: [(key: String, bundleId: String)] = [
+            ("ghostty", "com.mitchellh.ghostty"),
+            ("iterm", "com.googlecode.iterm2"),
+            ("warp", "dev.warp.Warp-Stable"),
+            ("terminal", "com.apple.Terminal"),
         ]
-        for bundleId in terminals {
+
+        if selected != "auto",
+           let match = terminalMap.first(where: { $0.key == selected }),
+           let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: match.bundleId) {
+            let config = NSWorkspace.OpenConfiguration()
+            config.activates = true
+            NSWorkspace.shared.openApplication(at: appURL, configuration: config)
+            return
+        }
+
+        // Auto-detect: try running terminals in priority order
+        for (_, bundleId) in terminalMap {
             if NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first != nil,
                let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) {
                 let config = NSWorkspace.OpenConfiguration()
@@ -737,16 +753,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
         }
+        // Fallback
         if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") {
             NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
         }
-    }
-
-    // MARK: - Public
-
-    var soundEnabled: Bool {
-        get { SoundManager.shared.enabled }
-        set { SoundManager.shared.enabled = newValue }
     }
 }
 
@@ -754,13 +764,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 struct SettingsView: View {
     let appDelegate: AppDelegate
-    @State private var soundEnabled: Bool
-    @State private var selectedTerminal = "auto"
-
-    init(appDelegate: AppDelegate) {
-        self.appDelegate = appDelegate
-        _soundEnabled = State(initialValue: appDelegate.soundEnabled)
-    }
+    @AppStorage("soundEnabled") private var soundEnabled = true
+    @AppStorage("selectedTerminal") private var selectedTerminal = "auto"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -782,7 +787,7 @@ struct SettingsView: View {
             // Status info
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text("状态")
+                    Text("label.status")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                     Spacer()
@@ -805,7 +810,7 @@ struct SettingsView: View {
                             .font(.caption.monospaced())
                     }
                     HStack {
-                        Text("工作目录")
+                        Text("label.workingDirectory")
                             .font(.caption)
                             .foregroundColor(.secondary)
                         Spacer()
@@ -820,14 +825,14 @@ struct SettingsView: View {
             Divider()
 
             // Settings
-            Toggle("音效提示", isOn: $soundEnabled)
+            Toggle("setting.soundAlert", isOn: $soundEnabled)
                 .font(.body)
                 .onChange(of: soundEnabled) { newValue in
-                    appDelegate.soundEnabled = newValue
+                    SoundManager.shared.enabled = newValue
                 }
 
-            Picker("终端应用", selection: $selectedTerminal) {
-                Text("自动检测").tag("auto")
+            Picker("setting.terminalApp", selection: $selectedTerminal) {
+                Text("setting.autoDetect").tag("auto")
                 Text("Terminal").tag("terminal")
                 Text("iTerm2").tag("iterm")
                 Text("Warp").tag("warp")
@@ -839,7 +844,7 @@ struct SettingsView: View {
 
             HStack {
                 Spacer()
-                Button("退出 Claude Dot") {
+                Button("action.quit") {
                     NSApp.terminate(nil)
                 }
                 .font(.body)
