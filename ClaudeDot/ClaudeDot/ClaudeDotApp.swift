@@ -136,6 +136,7 @@ class TranscriptMonitor {
         let message = json["message"] as? [String: Any] ?? [:]
         let content = message["content"] as? [[String: Any]] ?? []
 
+        var hasToolUseInMessage = false
         for item in content {
             let contentType = item["type"] as? String ?? ""
 
@@ -145,6 +146,7 @@ class TranscriptMonitor {
             case "text" where type == "assistant":
                 lastEventType = "text"
             case "tool_use":
+                hasToolUseInMessage = true
                 if let toolId = item["id"] as? String {
                     pendingToolIds.insert(toolId)
                 }
@@ -159,6 +161,11 @@ class TranscriptMonitor {
             }
         }
 
+        // Assistant message with text but no tool_use means final response — clear pending tools
+        if type == "assistant" && !content.isEmpty && !hasToolUseInMessage {
+            pendingToolIds.removeAll()
+        }
+
         // user type with tool_result content
         if type == "user" && !content.isEmpty {
             let hasToolResult = content.contains { ($0["type"] as? String) == "tool_result" }
@@ -170,7 +177,8 @@ class TranscriptMonitor {
                 }
                 lastEventType = "tool_result"
             } else {
-                // User sent a new message
+                // User sent a new message — all prior tool calls are resolved
+                pendingToolIds.removeAll()
                 lastEventType = "user_message"
             }
         }
@@ -342,8 +350,15 @@ class ClaudeStatusMonitor: @unchecked Sendable {
             return (.idle, session)
         }
 
-        // Priority 6: statusLine stale but no transcript activity → likely busy (API call)
-        if recency > 10.0 && !isStatusLineFresh() {
+        // Priority 6: No recent transcript activity and statusLine stale
+        // If the last event was a final response (text) or user_message that's gone stale,
+        // Claude is most likely idle (statusLine may not be configured or is lagging)
+        if recency > 10.0 {
+            let lastType = transcriptMonitor.lastEventType
+            if lastType == "text" || lastType == "user_message" || lastType == "" {
+                return (.idle, session)
+            }
+            // Only assume thinking if last event suggests an active operation
             return (.thinking, session)
         }
 
@@ -397,7 +412,9 @@ class NotificationHookSetup {
         if hooks["Notification"] == nil {
             hooks["Notification"] = [[
                 "matcher": "",
-                "commands": [scriptPath]
+                "hooks": [
+                    ["type": "command", "command": scriptPath]
+                ]
             ]]
             settings["hooks"] = hooks
             do {
@@ -687,7 +704,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.closePopover()
         }
         localClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
-            self?.closePopover()
+            guard let self = self else { return event }
+            if let popoverWindow = self.popover.contentViewController?.view.window,
+               event.window == popoverWindow {
+                return event
+            }
+            self.closePopover()
             return event
         }
     }
@@ -705,8 +727,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             "com.apple.Terminal"
         ]
         for bundleId in terminals {
-            if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first {
-                app.activate()
+            if NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first != nil,
+               let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) {
+                let config = NSWorkspace.OpenConfiguration()
+                config.activates = true
+                NSWorkspace.shared.openApplication(at: appURL, configuration: config)
                 return
             }
         }
