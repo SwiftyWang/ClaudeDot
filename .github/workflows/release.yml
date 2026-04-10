@@ -1,0 +1,52 @@
+name: Build and Release DMG
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: macos-15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Release Archive
+        run: |
+          xcodebuild archive \
+            -project ClaudeDot/ClaudeDot.xcodeproj \
+            -scheme ClaudeDot \
+            -configuration Release \
+            -archivePath build/ClaudeDot.xcarchive \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Extract .app from Archive
+        run: |
+          cp -R build/ClaudeDot.xcarchive/Products/Applications/ClaudeDot.app build/ClaudeDot.app
+
+      - name: Create DMG
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          mkdir -p build/dmg
+          cp -R build/ClaudeDot.app build/dmg/
+          ln -s /Applications build/dmg/Applications
+          hdiutil create -volname "ClaudeDot" \
+            -srcfolder build/dmg \
+            -ov -format UDZO \
+            "ClaudeDot-${VERSION}-macOS.dmg"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          gh release create "${GITHUB_REF_NAME}" \
+            "ClaudeDot-${VERSION}-macOS.dmg" \
+            --title "ClaudeDot v${VERSION}" \
+            --generate-notes
