@@ -2,7 +2,7 @@
 
 A tiny macOS menu bar dot that shows you what Claude Code is doing in real-time — so you don't have to keep checking the terminal.
 
-![macOS](https://img.shields.io/badge/macOS-26.3%2B-black)
+![macOS](https://img.shields.io/badge/macOS-13.0%2B-black)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ## What It Does
@@ -45,7 +45,7 @@ open ClaudeDot/ClaudeDot.xcodeproj
 # Press Cmd+R to build and run
 ```
 
-Requires Xcode 26+ and macOS 26.3 (Tahoe).
+Requires Xcode 15+ and macOS 13 (Ventura) or later.
 
 ## Usage
 
@@ -65,7 +65,7 @@ No manual configuration needed. Just launch and go.
 
 ## Requirements
 
-- macOS 26.3 (Tahoe) or later
+- macOS 13 (Ventura) or later
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI installed
 
 ## License

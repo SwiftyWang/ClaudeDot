@@ -690,6 +690,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             updatePopoverContent()
             popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
             addClickMonitors()
         }
     }
@@ -820,7 +822,7 @@ struct SettingsView: View {
             // Settings
             Toggle("音效提示", isOn: $soundEnabled)
                 .font(.body)
-                .onChange(of: soundEnabled) { _, newValue in
+                .onChange(of: soundEnabled) { newValue in
                     appDelegate.soundEnabled = newValue
                 }
 
