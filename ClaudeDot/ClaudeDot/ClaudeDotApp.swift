@@ -14,13 +14,29 @@ struct ClaudeDotApp: App {
 
 // MARK: - Claude Code Status
 
-enum ClaudeStatus: Equatable {
+enum ClaudeStatus: Equatable, Comparable {
     case disconnected
     case idle
     case thinking
     case responding
     case toolActive
     case awaitingPermission
+
+    /// Higher = more urgent, used to pick the primary session
+    var priority: Int {
+        switch self {
+        case .disconnected: return 0
+        case .idle: return 1
+        case .thinking: return 2
+        case .responding: return 3
+        case .toolActive: return 4
+        case .awaitingPermission: return 5
+        }
+    }
+
+    static func < (lhs: ClaudeStatus, rhs: ClaudeStatus) -> Bool {
+        lhs.priority < rhs.priority
+    }
 
     var label: String {
         switch self {
@@ -36,17 +52,17 @@ enum ClaudeStatus: Equatable {
     var color: NSColor {
         switch self {
         case .disconnected:
-            return NSColor(red: 120/255, green: 120/255, blue: 125/255, alpha: 1)
+            return NSColor(red: 142/255, green: 142/255, blue: 147/255, alpha: 1)
         case .idle:
-            return NSColor(red: 80/255, green: 180/255, blue: 80/255, alpha: 1)
+            return NSColor(red: 52/255, green: 199/255, blue: 89/255, alpha: 1)
         case .thinking:
-            return NSColor(red: 167/255, green: 139/255, blue: 250/255, alpha: 1)
+            return NSColor(red: 147/255, green: 112/255, blue: 255/255, alpha: 1)
         case .responding:
-            return NSColor(red: 96/255, green: 165/255, blue: 250/255, alpha: 1)
+            return NSColor(red: 64/255, green: 156/255, blue: 255/255, alpha: 1)
         case .toolActive:
-            return NSColor(red: 215/255, green: 119/255, blue: 87/255, alpha: 1)
+            return NSColor(red: 255/255, green: 149/255, blue: 0/255, alpha: 1)
         case .awaitingPermission:
-            return NSColor(red: 251/255, green: 191/255, blue: 36/255, alpha: 1)
+            return NSColor(red: 255/255, green: 204/255, blue: 0/255, alpha: 1)
         }
     }
 }
@@ -57,6 +73,7 @@ struct SessionInfo {
     let pid: Int
     let sessionId: String
     let cwd: String
+    var status: ClaudeStatus = .idle
 }
 
 // MARK: - Transcript Monitor (JSONL tail)
@@ -215,9 +232,11 @@ class ClaudeStatusMonitor: @unchecked Sendable {
         .appendingPathComponent(".claude/sessions")
     private let statusFilePath = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".claude/claudedot-status.json").path
+    private let projectsDir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".claude/projects").path
 
     private let stalenessThreshold: TimeInterval = 5.0
-    let transcriptMonitor = TranscriptMonitor()
+    private var transcriptMonitors: [String: TranscriptMonitor] = [:]
 
     /// Verify that a PID actually belongs to a Claude Code (node) process
     private func isClaudeProcess(_ pid: Int) -> Bool {
@@ -238,24 +257,6 @@ class ClaudeStatusMonitor: @unchecked Sendable {
         }
     }
 
-    /// Read transcript_path from statusLine JSON
-    private func readTranscriptPath() -> String? {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: statusFilePath)),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let path = json["transcript_path"] as? String
-        else { return nil }
-        return path
-    }
-
-    /// Read session_id from the status file
-    private func statusFileSessionId() -> String? {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: statusFilePath)),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let sid = json["session_id"] as? String
-        else { return nil }
-        return sid
-    }
-
     /// Check if statusLine file is fresh (being refreshed by idle Claude)
     private func isStatusLineFresh() -> Bool {
         let fm = FileManager.default
@@ -264,6 +265,74 @@ class ClaudeStatusMonitor: @unchecked Sendable {
               let modDate = attrs[.modificationDate] as? Date
         else { return false }
         return Date().timeIntervalSince(modDate) < stalenessThreshold
+    }
+
+    /// Derive transcript path for a session
+    private func transcriptPath(for session: SessionInfo) -> String? {
+        // Claude Code encodes cwd as: /Users/foo/bar → -Users-foo-bar
+        let encoded = session.cwd.replacingOccurrences(of: "/", with: "-")
+        let dir = projectsDir + "/" + encoded
+        let path = dir + "/" + session.sessionId + ".jsonl"
+        return FileManager.default.fileExists(atPath: path) ? path : nil
+    }
+
+    /// Get or create a TranscriptMonitor for a session
+    private func monitor(for session: SessionInfo) -> TranscriptMonitor {
+        if let existing = transcriptMonitors[session.sessionId] {
+            return existing
+        }
+        let tm = TranscriptMonitor()
+        transcriptMonitors[session.sessionId] = tm
+        return tm
+    }
+
+    /// Determine status for a single session using its transcript monitor
+    private func detectSessionStatus(session: SessionInfo, tm: TranscriptMonitor) -> ClaudeStatus {
+        tm.poll()
+
+        // Priority 1: Check notification hook for permission prompt
+        if NotificationHookSetup.hasActiveNotification() {
+            return .awaitingPermission
+        }
+
+        // Priority 2: Heuristic permission detection
+        if tm.hasActiveTool && tm.secondsSinceLastEvent > 3.0 && !isStatusLineFresh() {
+            return .awaitingPermission
+        }
+
+        // Priority 3: Active tool execution
+        if tm.hasActiveTool {
+            return .toolActive
+        }
+
+        // Priority 4: Recent transcript activity
+        let recency = tm.secondsSinceLastEvent
+        if recency < 10.0 {
+            switch tm.lastEventType {
+            case "thinking": return .thinking
+            case "text": return .responding
+            case "tool_result": return .thinking
+            case "tool_use": return .toolActive
+            case "user_message": return .thinking
+            default: break
+            }
+        }
+
+        // Priority 5: statusLine freshness
+        if isStatusLineFresh() {
+            return .idle
+        }
+
+        // Priority 6: Stale transcript
+        if recency > 10.0 {
+            let lastType = tm.lastEventType
+            if lastType == "text" || lastType == "user_message" || lastType == "" {
+                return .idle
+            }
+            return .thinking
+        }
+
+        return .idle
     }
 
     /// Find active Claude Code sessions from ~/.claude/sessions/
@@ -288,81 +357,35 @@ class ClaudeStatusMonitor: @unchecked Sendable {
         return sessions
     }
 
-    /// Main detection: combines process, transcript, statusLine, and notification signals
-    func detectStatus() -> (status: ClaudeStatus, session: SessionInfo?) {
-        let sessions = findActiveSessions()
-        guard let session = sessions.first else {
-            transcriptMonitor.reset()
+    /// Detect status for all active sessions
+    func detectAllSessions() -> [SessionInfo] {
+        var sessions = findActiveSessions()
+        guard !sessions.isEmpty else {
+            // Clean up all monitors
+            transcriptMonitors.values.forEach { $0.reset() }
+            transcriptMonitors.removeAll()
             cleanupStatusFile()
             NotificationHookSetup.clearMarker()
-            return (.disconnected, nil)
+            return []
         }
 
-        // Ensure transcript monitor is tracking the right file
-        if let path = readTranscriptPath() {
-            transcriptMonitor.setTranscriptPath(path)
-        }
-
-        // Poll for new transcript events
-        transcriptMonitor.poll()
-
-        // Priority 1: Check notification hook for permission prompt
-        if NotificationHookSetup.hasActiveNotification() {
-            return (.awaitingPermission, session)
-        }
-
-        // Priority 2: Heuristic permission detection
-        // tool_use pending + no transcript activity for 3s + statusLine not refreshing
-        if transcriptMonitor.hasActiveTool
-            && transcriptMonitor.secondsSinceLastEvent > 3.0
-            && !isStatusLineFresh() {
-            return (.awaitingPermission, session)
-        }
-
-        // Priority 3: Active tool execution
-        if transcriptMonitor.hasActiveTool {
-            return (.toolActive, session)
-        }
-
-        // Priority 4: Recent transcript activity determines thinking/responding
-        let recency = transcriptMonitor.secondsSinceLastEvent
-        if recency < 10.0 {
-            switch transcriptMonitor.lastEventType {
-            case "thinking":
-                return (.thinking, session)
-            case "text":
-                return (.responding, session)
-            case "tool_result":
-                // Just finished a tool, likely about to think or respond
-                return (.thinking, session)
-            case "tool_use":
-                return (.toolActive, session)
-            case "user_message":
-                // User just sent message, Claude about to think
-                return (.thinking, session)
-            default:
-                break
+        // Detect status for each session
+        let activeIds = Set(sessions.map { $0.sessionId })
+        for i in sessions.indices {
+            let tm = monitor(for: sessions[i])
+            if let path = transcriptPath(for: sessions[i]) {
+                tm.setTranscriptPath(path)
             }
+            sessions[i].status = detectSessionStatus(session: sessions[i], tm: tm)
         }
 
-        // Priority 5: statusLine freshness → idle
-        if isStatusLineFresh() {
-            return (.idle, session)
+        // Clean up monitors for sessions that no longer exist
+        for id in transcriptMonitors.keys where !activeIds.contains(id) {
+            transcriptMonitors[id]?.reset()
+            transcriptMonitors.removeValue(forKey: id)
         }
 
-        // Priority 6: No recent transcript activity and statusLine stale
-        // If the last event was a final response (text) or user_message that's gone stale,
-        // Claude is most likely idle (statusLine may not be configured or is lagging)
-        if recency > 10.0 {
-            let lastType = transcriptMonitor.lastEventType
-            if lastType == "text" || lastType == "user_message" || lastType == "" {
-                return (.idle, session)
-            }
-            // Only assume thinking if last event suggests an active operation
-            return (.thinking, session)
-        }
-
-        return (.idle, session)
+        return sessions
     }
 
     func cleanupStatusFile() {
@@ -535,17 +558,18 @@ class SoundManager {
 
 // MARK: - App Delegate
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private var popover = NSPopover()
     private var animationTimer: Timer?
     private var monitorTimer: Timer?
     private var pulsePhase: CGFloat = 0
     private(set) var currentStatus: ClaudeStatus = .disconnected
-    private(set) var currentSession: SessionInfo?
+    private(set) var allSessions: [SessionInfo] = []
+    var primarySession: SessionInfo? {
+        allSessions.max(by: { $0.status < $1.status })
+    }
     private let monitor = ClaudeStatusMonitor()
-    private var globalClickMonitor: Any?
-    private var localClickMonitor: Any?
     private var needsRestart = false
 
     private let dotSize: CGFloat = 10
@@ -577,15 +601,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setupPopover() {
-        popover.contentSize = NSSize(width: 300, height: 280)
-        popover.behavior = .semitransient
+        popover.contentSize = NSSize(width: 300, height: 0)
+        popover.behavior = .transient
+        popover.delegate = self
         updatePopoverContent()
     }
 
     private func updatePopoverContent() {
-        popover.contentViewController = NSHostingController(
+        let hostingController = NSHostingController(
             rootView: SettingsView(appDelegate: self)
         )
+        popover.contentViewController = hostingController
     }
 
     // MARK: - Dot Rendering
@@ -619,27 +645,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             switch self.currentStatus {
             case .disconnected:
                 // Static, dim
-                alpha = 0.3
+                alpha = 0.5
             case .idle:
-                // Gentle breathing, 1.5s cycle
-                let t = self.pulsePhase * (2 * .pi) / 3.0 // 3s full cycle = 1.5s half
-                alpha = 0.65 + 0.2 * CGFloat(sin(t))
+                // Gentle breathing, 3s cycle
+                let t = self.pulsePhase * (2 * .pi) / 3.0
+                alpha = 0.8 + 0.2 * CGFloat(sin(t))
             case .thinking:
                 // Soft pulse, 2s cycle
                 let t = self.pulsePhase * (2 * .pi) / 2.0
-                alpha = 0.5 + 0.4 * CGFloat(sin(t) * 0.5 + 0.5)
+                alpha = 0.7 + 0.3 * CGFloat(sin(t) * 0.5 + 0.5)
             case .responding:
                 // Medium pulse, 1.5s cycle
                 let t = self.pulsePhase * (2 * .pi) / 1.5
-                alpha = 0.45 + 0.5 * CGFloat(sin(t) * 0.5 + 0.5)
+                alpha = 0.7 + 0.3 * CGFloat(sin(t) * 0.5 + 0.5)
             case .toolActive:
                 // Fast pulse, 1s cycle
                 let t = self.pulsePhase * (2 * .pi) / 1.0
-                alpha = 0.4 + 0.6 * CGFloat(sin(t) * 0.5 + 0.5)
+                alpha = 0.7 + 0.3 * CGFloat(sin(t) * 0.5 + 0.5)
             case .awaitingPermission:
                 // Blink on/off, 0.8s cycle
                 let t = self.pulsePhase.truncatingRemainder(dividingBy: 0.8)
-                alpha = t < 0.4 ? 0.95 : 0.2
+                alpha = t < 0.4 ? 1.0 : 0.35
             }
             button.image = self.createDotImage(alpha: alpha)
         }
@@ -657,17 +683,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func checkClaudeStatus() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
-            let result = self.monitor.detectStatus()
+            let sessions = self.monitor.detectAllSessions()
             DispatchQueue.main.async {
-                self.currentSession = result.session
-                let newStatus = result.status
+                self.allSessions = sessions
+                let newStatus = self.primarySession?.status ?? .disconnected
                 if newStatus != self.currentStatus {
                     let oldStatus = self.currentStatus
                     self.currentStatus = newStatus
                     self.pulsePhase = 0
                     SoundManager.shared.playStatusChange(from: oldStatus, to: newStatus)
                     self.updatePopoverContent()
-                    // Clear notification marker when leaving awaitingPermission
                     if oldStatus == .awaitingPermission && newStatus != .awaitingPermission {
                         NotificationHookSetup.clearMarker()
                     }
@@ -689,53 +714,80 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func togglePopover(_ sender: NSStatusBarButton) {
         if popover.isShown {
-            closePopover()
+            popover.performClose(nil)
         } else {
             updatePopoverContent()
+            NSApp.activate(ignoringOtherApps: true)
             popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            addClickMonitors()
         }
     }
 
-    private func closePopover() {
-        popover.performClose(nil)
-        removeClickMonitors()
+    func popoverDidClose(_ notification: Notification) {
     }
 
-    private func addClickMonitors() {
-        globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            self?.closePopover()
-        }
-        localClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
-            guard let self = self else { return event }
-            if let popoverWindow = self.popover.contentViewController?.view.window,
-               event.window == popoverWindow {
-                return event
+    private static let terminalBundleIds = [
+        "com.mitchellh.ghostty",
+        "com.googlecode.iterm2",
+        "dev.warp.Warp-Stable",
+        "com.apple.Terminal",
+    ]
+
+    private static let terminalMap: [(key: String, bundleId: String)] = [
+        ("ghostty", "com.mitchellh.ghostty"),
+        ("iterm", "com.googlecode.iterm2"),
+        ("warp", "dev.warp.Warp-Stable"),
+        ("terminal", "com.apple.Terminal"),
+    ]
+
+    /// Walk up process tree from a PID to find the ancestor terminal app
+    private func findTerminalApp(for pid: Int) -> NSRunningApplication? {
+        var current = Int32(pid)
+        for _ in 0..<20 {
+            let ppid = parentPID(of: current)
+            if ppid <= 1 { break }
+            for bundleId in Self.terminalBundleIds {
+                for app in NSRunningApplication.runningApplications(withBundleIdentifier: bundleId) {
+                    if app.processIdentifier == ppid {
+                        return app
+                    }
+                }
             }
-            self.closePopover()
-            return event
+            current = ppid
         }
+        return nil
     }
 
-    private func removeClickMonitors() {
-        if let m = globalClickMonitor { NSEvent.removeMonitor(m); globalClickMonitor = nil }
-        if let m = localClickMonitor { NSEvent.removeMonitor(m); localClickMonitor = nil }
+    /// Get parent PID using sysctl
+    private func parentPID(of pid: Int32) -> Int32 {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0 else { return -1 }
+        return info.kp_eproc.e_ppid
     }
 
-    private func activateClaudeCode() {
+    /// Activate the terminal for a specific session
+    func activateTerminalForSession(_ session: SessionInfo) {
+        if let app = findTerminalApp(for: session.pid) {
+            app.activate()
+            return
+        }
+        // Fallback to generic activation
+        activateClaudeCode()
+    }
+
+    func activateClaudeCode() {
+        // If there's a primary session, try to find its terminal first
+        if let primary = primarySession, let app = findTerminalApp(for: primary.pid) {
+            app.activate()
+            return
+        }
+
         let selected = UserDefaults.standard.string(forKey: "selectedTerminal") ?? "auto"
 
-        let terminalMap: [(key: String, bundleId: String)] = [
-            ("ghostty", "com.mitchellh.ghostty"),
-            ("iterm", "com.googlecode.iterm2"),
-            ("warp", "dev.warp.Warp-Stable"),
-            ("terminal", "com.apple.Terminal"),
-        ]
-
         if selected != "auto",
-           let match = terminalMap.first(where: { $0.key == selected }),
+           let match = Self.terminalMap.first(where: { $0.key == selected }),
            let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: match.bundleId) {
             let config = NSWorkspace.OpenConfiguration()
             config.activates = true
@@ -744,7 +796,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Auto-detect: try running terminals in priority order
-        for (_, bundleId) in terminalMap {
+        for (_, bundleId) in Self.terminalMap {
             if NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first != nil,
                let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) {
                 let config = NSWorkspace.OpenConfiguration()
@@ -784,8 +836,9 @@ struct SettingsView: View {
 
             Divider()
 
-            // Status info
-            VStack(alignment: .leading, spacing: 6) {
+            // Session info
+            if appDelegate.allSessions.isEmpty {
+                // Disconnected
                 HStack {
                     Text("label.status")
                         .font(.subheadline)
@@ -793,31 +846,25 @@ struct SettingsView: View {
                     Spacer()
                     HStack(spacing: 4) {
                         Circle()
-                            .fill(Color(nsColor: appDelegate.colorForStatus(appDelegate.currentStatus)))
+                            .fill(Color(nsColor: ClaudeStatus.disconnected.color))
                             .frame(width: 6, height: 6)
-                        Text(appDelegate.currentStatus.label)
+                        Text(ClaudeStatus.disconnected.label)
                             .font(.subheadline)
                     }
                 }
-
-                if let session = appDelegate.currentSession {
-                    HStack {
-                        Text("PID")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        Spacer()
-                        Text("\(session.pid)")
-                            .font(.caption.monospaced())
-                    }
-                    HStack {
-                        Text("label.workingDirectory")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        Spacer()
-                        Text(shortenPath(session.cwd))
-                            .font(.caption.monospaced())
-                            .lineLimit(1)
-                            .truncationMode(.middle)
+            } else if appDelegate.allSessions.count == 1 {
+                // Single session — flat layout (no "Session 1" header)
+                sessionDetailView(appDelegate.allSessions[0])
+            } else {
+                // Multiple sessions — list with headers
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(appDelegate.allSessions.enumerated()), id: \.offset) { index, session in
+                        if index > 0 {
+                            Divider()
+                        }
+                        SessionRowButton(session: session, index: index + 1) {
+                            appDelegate.activateTerminalForSession(session)
+                        }
                     }
                 }
             }
@@ -852,6 +899,115 @@ struct SettingsView: View {
         }
         .padding(16)
         .frame(width: 300)
+    }
+
+    @ViewBuilder
+    private func sessionDetailView(_ session: SessionInfo) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("label.status")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                Spacer()
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(Color(nsColor: session.status.color))
+                        .frame(width: 6, height: 6)
+                    Text(session.status.label)
+                        .font(.subheadline)
+                }
+            }
+            HStack {
+                Text("PID")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text("\(session.pid)")
+                    .font(.caption.monospaced())
+            }
+            HStack {
+                Text("label.workingDirectory")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text(shortenPath(session.cwd))
+                    .font(.caption.monospaced())
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+    }
+
+    private func shortenPath(_ path: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if path.hasPrefix(home) {
+            return "~" + path.dropFirst(home.count)
+        }
+        return path
+    }
+}
+
+// MARK: - Session Row Button
+
+struct SessionRowButton: View {
+    let session: SessionInfo
+    let index: Int
+    let action: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("session.title \(index)")
+                .font(.subheadline.bold())
+            HStack {
+                Text("label.status")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                Spacer()
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(Color(nsColor: session.status.color))
+                        .frame(width: 6, height: 6)
+                    Text(session.status.label)
+                        .font(.subheadline)
+                }
+            }
+            HStack {
+                Text("PID")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text("\(session.pid)")
+                    .font(.caption.monospaced())
+            }
+            HStack {
+                Text("label.workingDirectory")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text(shortenPath(session.cwd))
+                    .font(.caption.monospaced())
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+        .padding(6)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(isHovered ? Color.primary.opacity(0.08) : Color.clear)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            action()
+        }
+        .onHover { hovering in
+            isHovered = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
     }
 
     private func shortenPath(_ path: String) -> String {
