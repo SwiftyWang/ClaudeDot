@@ -290,8 +290,8 @@ class ClaudeStatusMonitor: @unchecked Sendable {
     private func detectSessionStatus(session: SessionInfo, tm: TranscriptMonitor) -> ClaudeStatus {
         tm.poll()
 
-        // Priority 1: Check notification hook for permission prompt
-        if NotificationHookSetup.hasActiveNotification() {
+        // Priority 1: Check notification hook for permission prompt (per-session)
+        if NotificationHookSetup.hasActiveNotification(for: session.sessionId) {
             return .awaitingPermission
         }
 
@@ -450,14 +450,25 @@ class NotificationHookSetup {
         }
     }
 
-    /// Check if a notification marker exists and is fresh (< 30s)
-    static func hasActiveNotification() -> Bool {
+    /// Check if a notification marker exists, is fresh (< 30s), and matches the given session
+    static func hasActiveNotification(for sessionId: String? = nil) -> Bool {
         let fm = FileManager.default
         guard fm.fileExists(atPath: markerPath),
               let attrs = try? fm.attributesOfItem(atPath: markerPath),
-              let modDate = attrs[.modificationDate] as? Date
+              let modDate = attrs[.modificationDate] as? Date,
+              Date().timeIntervalSince(modDate) < 30.0
         else { return false }
-        return Date().timeIntervalSince(modDate) < 30.0
+
+        // If no sessionId filter, return true (backwards compat)
+        guard let sessionId = sessionId else { return true }
+
+        // Match against the session_id in the marker JSON
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: markerPath)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let markerSessionId = json["session_id"] as? String
+        else { return true } // Can't parse → assume it matches
+
+        return markerSessionId == sessionId
     }
 
     /// Clear notification marker (called when status changes away from awaiting)
