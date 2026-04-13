@@ -704,12 +704,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // MARK: - Click
 
     @objc private func statusBarButtonClicked(_ sender: NSStatusBarButton) {
-        guard let event = NSApp.currentEvent else { return }
-        if event.type == .rightMouseUp {
-            togglePopover(sender)
-        } else {
-            activateClaudeCode()
-        }
+        togglePopover(sender)
     }
 
     private func togglePopover(_ sender: NSStatusBarButton) {
@@ -717,9 +712,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             popover.performClose(nil)
         } else {
             updatePopoverContent()
+            NSApp.setActivationPolicy(.accessory)
             NSApp.activate(ignoringOtherApps: true)
             popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
-            popover.contentViewController?.view.window?.makeKeyAndOrderFront(nil)
+            if let window = popover.contentViewController?.view.window {
+                window.level = .popUpMenu
+                window.makeKeyAndOrderFront(nil)
+            }
         }
     }
 
@@ -767,20 +766,114 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return info.kp_eproc.e_ppid
     }
 
+    /// Get TTY for a PID via `ps`
+    private func getTTY(for pid: Int) -> String? {
+        let pipe = Pipe()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-p", "\(pid)", "-o", "tty="]
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let tty = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return tty.isEmpty ? nil : "/dev/\(tty)"
+        } catch {
+            return nil
+        }
+    }
+
+    /// Run an AppleScript via osascript and return whether it succeeded
+    private func runAppleScript(_ script: String) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    /// Focus the Terminal.app window/tab that owns the given TTY
+    private func focusTerminalTab(tty: String) -> Bool {
+        let script = """
+        tell application "Terminal"
+            activate
+            repeat with w in windows
+                repeat with t in tabs of w
+                    if tty of t is "\(tty)" then
+                        set selected of t to true
+                        set index of w to 1
+                        return
+                    end if
+                end repeat
+            end repeat
+        end tell
+        """
+        return runAppleScript(script)
+    }
+
+    /// Focus the iTerm2 session that owns the given TTY
+    private func focusITermSession(tty: String) -> Bool {
+        let script = """
+        tell application "iTerm2"
+            activate
+            repeat with w in windows
+                repeat with t in tabs of w
+                    repeat with s in sessions of t
+                        if tty of s is "\(tty)" then
+                            select t
+                            select w
+                            return
+                        end if
+                    end repeat
+                end repeat
+            end repeat
+        end tell
+        """
+        return runAppleScript(script)
+    }
+
     /// Activate the terminal for a specific session
     func activateTerminalForSession(_ session: SessionInfo) {
-        if let app = findTerminalApp(for: session.pid) {
-            app.activate()
-            return
+        let targetPid = session.pid
+        popover.performClose(nil)
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let tty = self.getTTY(for: targetPid)
+
+            DispatchQueue.main.async {
+                if let tty = tty {
+                    if let app = self.findTerminalApp(for: targetPid) {
+                        let bundleId = app.bundleIdentifier ?? ""
+
+                        if bundleId == "com.apple.Terminal" {
+                            if self.focusTerminalTab(tty: tty) { return }
+                        } else if bundleId == "com.googlecode.iterm2" {
+                            if self.focusITermSession(tty: tty) { return }
+                        }
+                        // For Ghostty/Warp or if AppleScript failed, just activate
+                        app.activate(options: .activateIgnoringOtherApps)
+                        return
+                    }
+                }
+                self.activateClaudeCode()
+            }
         }
-        // Fallback to generic activation
-        activateClaudeCode()
     }
 
     func activateClaudeCode() {
         // If there's a primary session, try to find its terminal first
         if let primary = primarySession, let app = findTerminalApp(for: primary.pid) {
-            app.activate()
+            app.activate(options: .activateIgnoringOtherApps)
             return
         }
 
@@ -854,7 +947,12 @@ struct SettingsView: View {
                 }
             } else if appDelegate.allSessions.count == 1 {
                 // Single session — flat layout (no "Session 1" header)
-                sessionDetailView(appDelegate.allSessions[0])
+                Button {
+                    appDelegate.activateTerminalForSession(appDelegate.allSessions[0])
+                } label: {
+                    sessionDetailView(appDelegate.allSessions[0])
+                }
+                .buttonStyle(.plain)
             } else {
                 // Multiple sessions — list with headers
                 VStack(alignment: .leading, spacing: 4) {
@@ -956,50 +1054,50 @@ struct SessionRowButton: View {
     @State private var isHovered = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("session.title \(index)")
-                .font(.subheadline.bold())
-            HStack {
-                Text("label.status")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-                Spacer()
-                HStack(spacing: 4) {
-                    Circle()
-                        .fill(Color(nsColor: session.status.color))
-                        .frame(width: 6, height: 6)
-                    Text(session.status.label)
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("session.title \(index)")
+                    .font(.subheadline.bold())
+                HStack {
+                    Text("label.status")
                         .font(.subheadline)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(Color(nsColor: session.status.color))
+                            .frame(width: 6, height: 6)
+                        Text(session.status.label)
+                            .font(.subheadline)
+                    }
+                }
+                HStack {
+                    Text("PID")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Text("\(session.pid)")
+                        .font(.caption.monospaced())
+                }
+                HStack {
+                    Text("label.workingDirectory")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Text(shortenPath(session.cwd))
+                        .font(.caption.monospaced())
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
             }
-            HStack {
-                Text("PID")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Spacer()
-                Text("\(session.pid)")
-                    .font(.caption.monospaced())
-            }
-            HStack {
-                Text("label.workingDirectory")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Spacer()
-                Text(shortenPath(session.cwd))
-                    .font(.caption.monospaced())
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
+            .padding(6)
+            .contentShape(Rectangle())
         }
-        .padding(6)
+        .buttonStyle(.plain)
         .background(
             RoundedRectangle(cornerRadius: 6)
                 .fill(isHovered ? Color.primary.opacity(0.08) : Color.clear)
         )
-        .contentShape(Rectangle())
-        .onTapGesture {
-            action()
-        }
         .onHover { hovering in
             isHovered = hovering
             if hovering {
