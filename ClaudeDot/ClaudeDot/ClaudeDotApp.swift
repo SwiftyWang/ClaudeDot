@@ -257,14 +257,20 @@ class ClaudeStatusMonitor: @unchecked Sendable {
         }
     }
 
-    /// Check if statusLine file is fresh (being refreshed by idle Claude)
-    private func isStatusLineFresh() -> Bool {
+    /// Check if statusLine file is fresh and belongs to a specific session
+    private func isStatusLineFresh(for sessionId: String) -> Bool {
         let fm = FileManager.default
         guard fm.fileExists(atPath: statusFilePath),
               let attrs = try? fm.attributesOfItem(atPath: statusFilePath),
-              let modDate = attrs[.modificationDate] as? Date
+              let modDate = attrs[.modificationDate] as? Date,
+              Date().timeIntervalSince(modDate) < stalenessThreshold
         else { return false }
-        return Date().timeIntervalSince(modDate) < stalenessThreshold
+        // Verify the statusLine file belongs to this session
+        guard let data = fm.contents(atPath: statusFilePath),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let fileSessionId = json["session_id"] as? String
+        else { return true } // If we can't parse, fall back to freshness-only check
+        return fileSessionId == sessionId
     }
 
     /// Derive transcript path for a session
@@ -296,7 +302,7 @@ class ClaudeStatusMonitor: @unchecked Sendable {
         }
 
         // Priority 2: Heuristic permission detection
-        if tm.hasActiveTool && tm.secondsSinceLastEvent > 3.0 && !isStatusLineFresh() {
+        if tm.hasActiveTool && tm.secondsSinceLastEvent > 3.0 && !isStatusLineFresh(for: session.sessionId) {
             return .awaitingPermission
         }
 
@@ -305,12 +311,12 @@ class ClaudeStatusMonitor: @unchecked Sendable {
             return .toolActive
         }
 
-        // Priority 4: Recent transcript activity
+        // Priority 4: Recent transcript activity (within 30s)
         let recency = tm.secondsSinceLastEvent
-        if recency < 10.0 {
+        if recency < 30.0 {
             switch tm.lastEventType {
             case "thinking": return .thinking
-            case "text": return .responding
+            case "text" where recency < 10.0: return .responding
             case "tool_result": return .thinking
             case "tool_use": return .toolActive
             case "user_message": return .thinking
@@ -318,18 +324,31 @@ class ClaudeStatusMonitor: @unchecked Sendable {
             }
         }
 
-        // Priority 5: statusLine freshness
-        if isStatusLineFresh() {
+        // Priority 5: statusLine freshness — process is alive but not necessarily idle
+        if isStatusLineFresh(for: session.sessionId) {
+            // If the last event suggests active work within a reasonable window,
+            // maintain active status instead of showing idle
+            if recency < 120.0 {
+                switch tm.lastEventType {
+                case "thinking", "tool_result", "user_message": return .thinking
+                case "tool_use": return .toolActive
+                default: break
+                }
+            }
             return .idle
         }
 
-        // Priority 6: Stale transcript
-        if recency > 10.0 {
-            let lastType = tm.lastEventType
-            if lastType == "text" || lastType == "user_message" || lastType == "" {
-                return .idle
+        // Priority 6: Stale transcript, process may not be responsive
+        let lastType = tm.lastEventType
+        if lastType == "text" || lastType == "" {
+            return .idle
+        }
+        if recency < 120.0 {
+            switch lastType {
+            case "thinking", "tool_result", "user_message": return .thinking
+            case "tool_use": return .toolActive
+            default: return .idle
             }
-            return .thinking
         }
 
         return .idle
